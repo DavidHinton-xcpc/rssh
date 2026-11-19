@@ -1,10 +1,17 @@
+import { BackgroundMode, backgroundTaskManager } from '@kit.BackgroundTasksKit';
+import { common, Want, WantAgent, wantAgent } from '@kit.AbilityKit';
+import { BusinessError } from '@kit.BasicServicesKit';
 import { NativeAbility } from '@ohos-rs/ability';
 import { window } from '@kit.ArkUI';
 import { rsshPlugins } from './RsshPlugins';
 
+const CONTINUOUS_TASK_LOG_TAG = '[RsshAbility]';
+
 export class RsshAbility extends NativeAbility {
   public moduleName: string = 'rssh_ohos';
   public bridgePlugins = rsshPlugins(true);
+  private continuousTaskStarting: Promise<void> | null = null;
+  private continuousTaskActive: boolean = false;
 
   protected override async loadWindowStageContent(windowStage: window.WindowStage): Promise<void> {
     // This mobile HAP serves both phones and tablets; desktop has its own Ability.
@@ -14,7 +21,7 @@ export class RsshAbility extends NativeAbility {
       const mainWindow = await windowStage.getMainWindow();
       await mainWindow.setSpecificSystemBarEnabled('status', false);
     } catch (error) {
-      console.error(`[RsshAbility] Failed to hide mobile status bar: ${String(error)}`);
+      console.error(`${CONTINUOUS_TASK_LOG_TAG} Failed to hide mobile status bar: ${String(error)}`);
     }
     await windowStage.loadContent('pages/Index');
   }
@@ -27,5 +34,83 @@ export class RsshAbility extends NativeAbility {
     context.basePath = filesDir;
     context.prefPath = filesDir;
     return context;
+  }
+
+  /**
+   * Keep the process scheduled while a port forward is active in the background.
+   * The RSSH engine keeps its forwards in the native runtime regardless of window
+   * visibility; the continuous task only prevents HarmonyOS from suspending that
+   * runtime. DATA_TRANSFER matches the app's actual background network workload.
+   */
+  onBackground(): void {
+    super.onBackground();
+    void this.startContinuousTask();
+  }
+
+  onForeground(): void {
+    void this.releaseContinuousTask().catch((error: BusinessError) => {
+      console.warn(`${CONTINUOUS_TASK_LOG_TAG} Failed to release continuous task: ${String(error)}`);
+    });
+    super.onForeground();
+  }
+
+  onDestroy(): Promise<void> {
+    const destroyed = super.onDestroy();
+    void this.releaseContinuousTask().catch((error: BusinessError) => {
+      console.warn(`${CONTINUOUS_TASK_LOG_TAG} Failed to release continuous task: ${String(error)}`);
+    });
+    return destroyed;
+  }
+
+  private async startContinuousTask(): Promise<void> {
+    if (this.continuousTaskActive) return;
+    if (this.continuousTaskStarting) {
+      await this.continuousTaskStarting;
+      return;
+    }
+    const starting = this.createWantAgent()
+      .then((agent: WantAgent) => backgroundTaskManager.startBackgroundRunning(
+        this.context as common.UIAbilityContext,
+        BackgroundMode.DATA_TRANSFER,
+        agent,
+      ))
+      .then(() => {
+        this.continuousTaskActive = true;
+        console.info(`${CONTINUOUS_TASK_LOG_TAG} Background data-transfer task started`);
+      })
+      .catch((error: BusinessError) => {
+        // The task is best-effort: a rejection must not break the UI lifecycle.
+        console.warn(`${CONTINUOUS_TASK_LOG_TAG} Background task unavailable: ${error.code} ${error.message}`);
+      })
+      .finally(() => {
+        this.continuousTaskStarting = null;
+      });
+    this.continuousTaskStarting = starting;
+    await starting;
+  }
+
+  private async releaseContinuousTask(): Promise<void> {
+    if (this.continuousTaskStarting) {
+      await this.continuousTaskStarting;
+    }
+    if (!this.continuousTaskActive) return;
+    this.continuousTaskActive = false;
+    await backgroundTaskManager.stopBackgroundRunning(this.context as common.UIAbilityContext);
+    console.info(`${CONTINUOUS_TASK_LOG_TAG} Background data-transfer task stopped`);
+  }
+
+  private async createWantAgent(): Promise<WantAgent> {
+    const want: Want = {
+      bundleName: 'com.rssh.app',
+      moduleName: 'entry',
+      abilityName: 'EntryAbility',
+    };
+    const info: wantAgent.WantAgentInfo = {
+      wants: [want],
+      actionType: wantAgent.OperationType.START_ABILITY,
+      requestCode: 0,
+      wantAgentFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG],
+    };
+    return await wantAgent.getWantAgent(info);
   }
 }

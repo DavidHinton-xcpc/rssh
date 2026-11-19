@@ -20,16 +20,38 @@ function harness() {
     context = context;
     createInitContext(moduleName: string) { return createInitContext(moduleName); }
     onCreate() {}
+    onForeground() { lifecycleCalls.push("foreground"); }
+    onBackground() { lifecycleCalls.push("background"); }
     onWindowStageCreate() {}
     onWindowStageDestroy() {}
-    onDestroy() {}
+    onDestroy() { lifecycleCalls.push("destroy"); return Promise.resolve(); }
   }
+  const lifecycleCalls: string[] = [];
+  const startBackgroundRunning = vi.fn().mockResolvedValue(undefined);
+  const stopBackgroundRunning = vi.fn().mockResolvedValue(undefined);
+  const getWantAgent = vi.fn().mockResolvedValue({ id: "want-agent" });
   const logError = vi.fn();
+  const logWarn = vi.fn();
+  const logInfo = vi.fn();
   const modules: Record<string, unknown> = {
     "@ohos-rs/ability": {
       NativeAbility,
       LazyPlugin: class { constructor(public create: () => { id: string }) {} },
     },
+    "@kit.BackgroundTasksKit": {
+      BackgroundMode: { DATA_TRANSFER: 1 },
+      backgroundTaskManager: { startBackgroundRunning, stopBackgroundRunning },
+    },
+    "@kit.AbilityKit": {
+      common: {},
+      WantAgent: class {},
+      wantAgent: {
+        getWantAgent,
+        OperationType: { START_ABILITY: 1 },
+        WantAgentFlags: { UPDATE_PRESENT_FLAG: 1 },
+      },
+    },
+    "@kit.BasicServicesKit": { BusinessError: class {} },
   };
   for (const [pkg, cls, id] of [
     ["files", "FilesPlugin", "ohos.files"], ["url", "UrlPlugin", "ohos.url"],
@@ -63,8 +85,8 @@ function harness() {
   runInNewContext(code, { exports, require: (name: string) => {
     if (!(name in modules)) throw new Error(`Unexpected native dependency: ${name}`);
     return modules[name];
-  }, console: { error: logError } }, { filename: sourcePath });
-  return { ability: new exports.RsshAbility(), NativeAbility, initContext, createInitContext, applicationContext, logError };
+  }, console: { error: logError, warn: logWarn, info: logInfo } }, { filename: sourcePath });
+  return { ability: new exports.RsshAbility(), NativeAbility, initContext, createInitContext, applicationContext, logError, logWarn, logInfo, lifecycleCalls, startBackgroundRunning, stopBackgroundRunning, getWantAgent };
 }
 
 describe("HarmonyOS framework host", () => {
@@ -74,6 +96,8 @@ describe("HarmonyOS framework host", () => {
     ), "utf8"));
     expect(module.deviceTypes).toEqual(["phone", "tablet"]);
     expect(module.metadata ?? []).not.toContainEqual({ name: "avoid_cutout", value: "true" });
+    expect(module.abilities[0].backgroundModes).toEqual(["dataTransfer"]);
+    expect(module.requestPermissions).toContainEqual({ name: "ohos.permission.KEEP_BACKGROUND_RUNNING" });
   });
 
   it("does not restore a raw database without its device-bound master key", () => {
@@ -94,9 +118,38 @@ describe("HarmonyOS framework host", () => {
 
   it("lets NativeAbility own creation, teardown and cancellation", () => {
     const h = harness();
-    for (const name of ["onCreate", "onWindowStageCreate", "onWindowStageDestroy", "onDestroy"] as const) {
+    for (const name of ["onCreate", "onWindowStageCreate", "onWindowStageDestroy"] as const) {
       expect(h.ability[name]).toBe(h.NativeAbility.prototype[name]);
     }
+  });
+
+  it("requests and releases a data-transfer continuous task around background/foreground", async () => {
+    const h = harness();
+    h.ability.onBackground();
+    await vi.waitFor(() => expect(h.startBackgroundRunning).toHaveBeenCalledTimes(1));
+    expect(h.getWantAgent).toHaveBeenCalledWith(expect.objectContaining({
+      wants: [{ bundleName: "com.rssh.app", moduleName: "entry", abilityName: "EntryAbility" }],
+    }));
+    expect(h.startBackgroundRunning).toHaveBeenCalledWith(
+      expect.objectContaining({ filesDir: "/isolated-test/base/haps/entry/files" }),
+      1,
+      { id: "want-agent" },
+    );
+
+    h.ability.onForeground();
+    await vi.waitFor(() => expect(h.stopBackgroundRunning).toHaveBeenCalledTimes(1));
+    expect(h.stopBackgroundRunning).toHaveBeenCalledWith(
+      expect.objectContaining({ filesDir: "/isolated-test/base/haps/entry/files" }),
+    );
+    expect(h.lifecycleCalls).toEqual(["background", "foreground"]);
+  });
+
+  it("does not fail lifecycle calls when the continuous task is rejected", async () => {
+    const h = harness();
+    h.startBackgroundRunning.mockRejectedValueOnce(Object.assign(new Error("denied"), { code: 201, message: "denied" }));
+    expect(() => h.ability.onBackground()).not.toThrow();
+    await vi.waitFor(() => expect(h.logWarn).toHaveBeenCalled());
+    expect(h.stopBackgroundRunning).not.toHaveBeenCalled();
   });
 
   it("hides only the mobile status bar before loading the page", async () => {
