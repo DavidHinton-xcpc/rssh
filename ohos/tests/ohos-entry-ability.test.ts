@@ -29,6 +29,7 @@ function harness() {
   const lifecycleCalls: string[] = [];
   const startBackgroundRunning = vi.fn().mockResolvedValue(undefined);
   const stopBackgroundRunning = vi.fn().mockResolvedValue(undefined);
+  const onTaskCancel = vi.fn();
   const getWantAgent = vi.fn().mockResolvedValue({ id: "want-agent" });
   const logError = vi.fn();
   const logWarn = vi.fn();
@@ -39,8 +40,8 @@ function harness() {
       LazyPlugin: class { constructor(public create: () => { id: string }) {} },
     },
     "@kit.BackgroundTasksKit": {
-      BackgroundMode: { DATA_TRANSFER: 1 },
-      backgroundTaskManager: { startBackgroundRunning, stopBackgroundRunning },
+      BackgroundMode: { MULTI_DEVICE_CONNECTION: 6 },
+      backgroundTaskManager: { startBackgroundRunning, stopBackgroundRunning, on: onTaskCancel, off: vi.fn() },
     },
     "@kit.AbilityKit": {
       common: {},
@@ -86,7 +87,7 @@ function harness() {
     if (!(name in modules)) throw new Error(`Unexpected native dependency: ${name}`);
     return modules[name];
   }, console: { error: logError, warn: logWarn, info: logInfo } }, { filename: sourcePath });
-  return { ability: new exports.RsshAbility(), NativeAbility, initContext, createInitContext, applicationContext, logError, logWarn, logInfo, lifecycleCalls, startBackgroundRunning, stopBackgroundRunning, getWantAgent };
+  return { ability: new exports.RsshAbility(), NativeAbility, initContext, createInitContext, applicationContext, logError, logWarn, logInfo, lifecycleCalls, startBackgroundRunning, stopBackgroundRunning, getWantAgent, onTaskCancel };
 }
 
 describe("HarmonyOS framework host", () => {
@@ -96,7 +97,7 @@ describe("HarmonyOS framework host", () => {
     ), "utf8"));
     expect(module.deviceTypes).toEqual(["phone", "tablet"]);
     expect(module.metadata ?? []).not.toContainEqual({ name: "avoid_cutout", value: "true" });
-    expect(module.abilities[0].backgroundModes).toEqual(["dataTransfer"]);
+    expect(module.abilities[0].backgroundModes).toEqual(["multiDeviceConnection"]);
     expect(module.requestPermissions).toContainEqual({ name: "ohos.permission.KEEP_BACKGROUND_RUNNING" });
   });
 
@@ -132,7 +133,7 @@ describe("HarmonyOS framework host", () => {
     }));
     expect(h.startBackgroundRunning).toHaveBeenCalledWith(
       expect.objectContaining({ filesDir: "/isolated-test/base/haps/entry/files" }),
-      1,
+      6,
       { id: "want-agent" },
     );
 
@@ -150,6 +151,34 @@ describe("HarmonyOS framework host", () => {
     expect(() => h.ability.onBackground()).not.toThrow();
     await vi.waitFor(() => expect(h.logWarn).toHaveBeenCalled());
     expect(h.stopBackgroundRunning).not.toHaveBeenCalled();
+  });
+
+  it("requests a fresh task after the system cancels one behind the app's back", async () => {
+    const h = harness();
+    h.ability.onBackground();
+    await vi.waitFor(() => expect(h.startBackgroundRunning).toHaveBeenCalledTimes(1));
+    expect(h.onTaskCancel).toHaveBeenCalledExactlyOnceWith("continuousTaskCancel", expect.any(Function));
+
+    const [, cancelCallback] = h.onTaskCancel.mock.calls[0];
+    cancelCallback({ reason: 12 });
+
+    h.ability.onForeground();
+    await vi.waitFor(() => expect(h.lifecycleCalls).toEqual(["background", "foreground"]));
+    expect(h.stopBackgroundRunning).not.toHaveBeenCalled();
+
+    h.ability.onBackground();
+    await vi.waitFor(() => expect(h.startBackgroundRunning).toHaveBeenCalledTimes(2));
+  });
+
+  it("does not double-register the cancel listener across repeated background entries", async () => {
+    const h = harness();
+    h.ability.onBackground();
+    await vi.waitFor(() => expect(h.startBackgroundRunning).toHaveBeenCalledTimes(1));
+    h.ability.onForeground();
+    await vi.waitFor(() => expect(h.stopBackgroundRunning).toHaveBeenCalledTimes(1));
+    h.ability.onBackground();
+    await vi.waitFor(() => expect(h.startBackgroundRunning).toHaveBeenCalledTimes(2));
+    expect(h.onTaskCancel).toHaveBeenCalledTimes(1);
   });
 
   it("hides only the mobile status bar before loading the page", async () => {

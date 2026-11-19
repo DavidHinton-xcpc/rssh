@@ -23,7 +23,7 @@
         "orientation": "auto_rotation_restricted",
         "exported": true,
         "backgroundModes": [
-          "dataTransfer"
+          "multiDeviceConnection"
         ],
         "skills": [
           {

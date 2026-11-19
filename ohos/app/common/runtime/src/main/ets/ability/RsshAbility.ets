@@ -12,6 +12,7 @@ export class RsshAbility extends NativeAbility {
   public bridgePlugins = rsshPlugins(true);
   private continuousTaskStarting: Promise<void> | null = null;
   private continuousTaskActive: boolean = false;
+  private continuousTaskCancelRegistered = false;
 
   protected override async loadWindowStageContent(windowStage: window.WindowStage): Promise<void> {
     // This mobile HAP serves both phones and tablets; desktop has its own Ability.
@@ -40,7 +41,10 @@ export class RsshAbility extends NativeAbility {
    * Keep the process scheduled while a port forward is active in the background.
    * The RSSH engine keeps its forwards in the native runtime regardless of window
    * visibility; the continuous task only prevents HarmonyOS from suspending that
-   * runtime. DATA_TRANSFER matches the app's actual background network workload.
+   * runtime. MULTI_DEVICE_CONNECTION matches a persistent SSH connection: unlike
+   * DATA_TRANSFER it has no progress-notification requirement, so an idle
+   * forwarding tunnel keeps its task instead of being cancelled after ten idle
+   * minutes (SYSTEM_CANCEL_DATA_TRANSFER_NOT_UPDATE / _LOW_SPEED).
    */
   onBackground(): void {
     super.onBackground();
@@ -68,10 +72,11 @@ export class RsshAbility extends NativeAbility {
       await this.continuousTaskStarting;
       return;
     }
+    this.registerCancelListener();
     const starting = this.createWantAgent()
       .then((agent: WantAgent) => backgroundTaskManager.startBackgroundRunning(
         this.context as common.UIAbilityContext,
-        BackgroundMode.DATA_TRANSFER,
+        BackgroundMode.MULTI_DEVICE_CONNECTION,
         agent,
       ))
       .then(() => {
@@ -87,6 +92,26 @@ export class RsshAbility extends NativeAbility {
       });
     this.continuousTaskStarting = starting;
     await starting;
+  }
+
+  /**
+   * The system can revoke the task behind our back — idle-timeout enforcement,
+   * or the user swiping the continuous-task notification away. Reset the flag
+   * so the next onBackground() requests a fresh task instead of skipping it.
+   */
+  private registerCancelListener(): void {
+    if (this.continuousTaskCancelRegistered) return;
+    try {
+      backgroundTaskManager.on('continuousTaskCancel', (info: backgroundTaskManager.ContinuousTaskCancelInfo) => {
+        if (this.continuousTaskActive) {
+          this.continuousTaskActive = false;
+          console.warn(`${CONTINUOUS_TASK_LOG_TAG} Background task cancelled by system: ${info.reason}`);
+        }
+      });
+      this.continuousTaskCancelRegistered = true;
+    } catch (error) {
+      console.warn(`${CONTINUOUS_TASK_LOG_TAG} Cancel listener unavailable: ${String(error)}`);
+    }
   }
 
   private async releaseContinuousTask(): Promise<void> {
